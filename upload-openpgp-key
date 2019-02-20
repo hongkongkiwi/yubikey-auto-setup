@@ -1,0 +1,233 @@
+#!/bin/bash
+
+# Here is a great selection of info about Yubikey and gpg
+# https://xladius.com/opsec/2018/06/25/using-yubikeys-for-openpgp
+
+# Some handy GPG commands
+# https://github.com/yankhobacisse/nitrokey/blob/3130f7241d31f8b90d4b561a9f4d757b983343c0/peopleInfo.sh
+
+YKMAN_BIN="ykman"
+GPG_BIN="gpg"
+
+YUBKEY_LIST=("")
+
+function check_required_programs() {
+  command -v ykman >/dev/null 2>&1 || { echo >&2 "I require ykman but it's not installed.  Aborting."; echo >&2 "https://github.com/Yubico/yubikey-manager"; exit 1; }
+  command -v gpg >/dev/null 2>&1 || { echo >&2 "I require gpg but it's not installed.  Aborting."; exit 1; }
+  command -v sed >/dev/null 2>&1 || { echo >&2 "I require sed but it's not installed.  Aborting."; exit 1; }
+  command -v grep >/dev/null 2>&1 || { echo >&2 "I require grep but it's not installed.  Aborting."; exit 1; }
+  command -v dd >/dev/null 2>&1 || { echo >&2 "I require dd but it's not installed.  Aborting."; exit 1; }
+  command -v tr >/dev/null 2>&1 || { echo >&2 "I require tr but it's not installed.  Aborting."; exit 1; }
+  command -v cut >/dev/null 2>&1 || { echo >&2 "I require cut but it's not installed.  Aborting."; exit 1; }
+}
+
+function trim() {
+    local var="$*"
+    # remove leading whitespace characters
+    var="${var#"${var%%[![:space:]]*}"}"
+    # remove trailing whitespace characters
+    var="${var%"${var##*[![:space:]]}"}"
+    echo -n "$var"
+}
+
+function get_connected_yubikeys() {
+  OFS=$IFS
+  IFS=$'\n'
+  declare -a YUBKEY_LIST=(`$YKMAN_BIN list`)
+  IFS=$OFS
+  if [ ${#YUBKEY_LIST[@]} -eq 0 ]; then
+    echo "No Yubikeys Found!"
+    exit 1
+  elif [ ${#YUBKEY_LIST[@]} -gt 1 ]; then
+    echo "Multiple Yubikeys Found!"
+    echo "Please Select One:"
+    for i in "${!YUBKEY_LIST[@]}"; do
+      echo " $i) ${YUBKEY_LIST[i]}"
+    done
+    echo " q) Quit"
+    while true; do
+        read -p '# ' n
+        if [ "$n" == "q" ]; then
+          echo "Exited!"
+          exit 1
+        fi
+        # Check if number
+        re='^[0-9]+$'
+        if ! [[ $n =~ $re ]]; then
+          continue
+        fi
+        # If $n is an integer between one and $count...
+        if [ "$n" -eq "$n" ] && [ "$n" -gt -1 ] && [ "$n" -le "${#YUBKEY_LIST[@]}" ]; then
+          break
+        fi
+    done
+    CURRENT_YUBIKEY_SERIAL=${YUBKEY_LIST[$n]#*"Serial: "}
+    echo "You Selected Device: ${YUBKEY_LIST[$n]}"
+  else
+    CURRENT_YUBIKEY_SERIAL=${YUBKEY_LIST[0]#*"Serial: "}
+    echo " - Found Device Device: ${YUBKEY_LIST[$n]}"
+  fi
+}
+
+function warn_user() {
+  echo "*** WARNING ***"
+  read -r -p " This will completely reset your Yubikey. Are you sure? [y/N] " response
+  case "$response" in
+    [yY][eE][sS]|[yY])
+      ;;
+    *)
+      echo "Exited!"; exit 1
+      ;;
+  esac
+}
+
+function reset_openpgp_data() {
+  {
+  	echo admin
+  	echo factory-reset
+  	echo y
+  	echo yes
+    echo quit
+  } | $GPG_BIN --command-fd=0 --status-fd=1 --card-edit
+}
+
+function change_openpgp_pin() {
+  {
+  	echo admin
+  	echo passwd
+  	echo 3
+  	echo Q
+  	echo quit
+  } | $GPG_BIN --command-fd=0 --status-fd=1 --card-edit
+}
+
+function reset_openpgp_data() {
+  {
+  	echo admin
+  	echo factory-reset
+  	echo y
+  	echo yes
+    echo quit
+  } | $GPG_BIN --command-fd=0 --status-fd=1 --card-edit
+}
+
+function change_key_size() {
+  # The algorithms supported by nitrokey pro are rsa 2048 at rsa 4096
+  # change in the size of the keys
+  {
+  	echo admin       # To have the right to exude the admin rights
+  	echo key-attr    # to change the length of keys or algorithms
+  	echo 1           # (1) RSA (2) ECC RSA for the signature ie here the only supported algorithm
+  	echo 2048        # 2048-4096 the size of the signature subkey
+  	echo 1           # (1) RSA (2) ECC RSA for encryption subkey
+  	echo 2048        # 2048-4096 the size of the subkey of encryption
+  	echo 1           # (1) RSA (2) ECC RSA for the authentication subkey
+  	echo 2048        # 2048-4096 the size of the subkey authentication
+  	echo quit
+  } | $GPG_BIN --command-fd = 0 --status-fd = 1 --card-edit
+}
+
+function generate_keys() {
+  # Generation of a pair of keys in the token without a local copy
+  {
+  	echo admin        # To have the right to exude the admin rights
+  	echo generate     # to generate the keys in the token
+  	echo n            # (o / n) no local copy
+  	echo 0            # the key never expires
+  	echo O            # yes yes confirmation
+  	echo  " $KEY_OWNER_NAME "      # the real name of the owner of the keys
+  	echo  " $KEY_EMAIL "      # the email address of the owner of the keys
+  	echo nocomment # no comment
+  	echo o            # yes confirmation of information for key
+  	echo list         # display information in the map
+  	echo quit
+  } | $GPG_BIN --command-fd = 0 --status-fd = 1 --card-edit
+}
+
+function personalise_smart_card() {
+  # Personalization of the smart card
+  {
+  	echo admin    # To execute the administrator rights
+  	echo passwd   # To change the user or administrator PIN
+  	echo 1        # Change administrator PIN
+  	echo q        # Leave the PIN change
+  	echo name     # To change the user name
+  	echo  " $LAST_NAME "     # User's response
+  	echo  " $FIRST_NAME "     # Username
+  	echo login    # To change the login
+  	echo  " $LOGIN "  # the user's login
+  	echo sex      # the sex of the user
+  	echo " $SEX "        # (M) ale (F) emele or space if unknown
+  	echo lang     # to change the language
+  	echo " $LANG " # fr for french, en for english
+  	echo list     # show map information
+  	echo quit     # when editing the map
+  } | $GPG_BIN --command-fd = 0 --status-fd = 1 --card-edit
+}
+
+function get_gpg_card_info() {
+  CARD_INFO=`$GPG_BIN --card-status --with-colons`
+  CARD_SERIAL=`echo "$CARD_INFO" | grep "serial:" | cut -f2 -d':'`
+  CARD_READER_NAME=`echo "$CARD_INFO" | grep "Reader:" | cut -f2 -d':'`
+  CARD_READER_VERSION=`echo "$CARD_INFO" | grep "version:" | cut -f2 -d':'`
+  CARD_READER_VENDOR_NAME=`echo "$CARD_INFO" | grep "vendor:" | cut -f3 -d':'`
+  CARD_DETAILS_FIRST_NAME=`echo "$CARD_INFO" | grep "name:" | cut -f2 -d':'`
+  CARD_DETAILS_LAST_NAME=`echo "$CARD_INFO" | grep "name:" | cut -f3 -d':'`
+  CARD_DETAILS_SEX=`echo "$CARD_INFO" | grep "sex:" | cut -f2 -d':'`
+  CARD_DETAILS_LANG=`echo "$CARD_INFO" | grep "lang:" | cut -f2 -d':'`
+  CARD_DETAILS_URL=`echo "$CARD_INFO" | grep "url:" | cut -f2 -d':'`
+  CARD_DETAILS_LOGIN=`echo "$CARD_INFO" | grep "login:" | cut -f2 -d':'`
+  CARD_DETAILS_FORCEPIN=`echo "$CARD_INFO" | grep "forcepin:" | cut -f2 -d':'`
+
+  # echo $CARD_SERIAL
+  # echo $CARD_READER_NAME
+  # echo $CARD_READER_VERSION
+  # echo $CARD_READER_VENDOR_NAME
+  # echo $CARD_DETAILS_FIRST_NAME
+  # echo $CARD_DETAILS_LAST_NAME
+  # echo $CARD_DETAILS_SEX
+  # echo $CARD_DETAILS_LANG
+  # echo $CARD_DETAILS_URL
+  # echo $CARD_DETAILS_LOGIN
+  # echo $CARD_DETAILS_FORCEPIN
+
+  # Reader:Yubico Yubikey 4 CCID:AID:23423432:openpgp-card:
+  # version:0201:
+  # vendor:0006:Yubico:
+  # serial:242424:
+  # name:FirstBlah:SecondBlah:
+  # lang::
+  # sex:u:
+  # url::
+  # login::
+  # forcepin:0:::
+  # keyattr:1:1:2048:
+  # keyattr:2:1:2048:
+  # keyattr:3:1:2048:
+  # maxpinlen:127:127:127:
+  # pinretry:3:0:3:
+  # sigcount:0:::
+  # cafpr::::
+  # fpr::::
+  # fprtime:0:0:0:
+  # grp:0000000000000000000000000000000000000000:0000000000000000000000000000000000000000:0000000000000000000000000000000000000000:
+
+  # OFS=$IFS
+  # IFS=$'\n'
+  # declare -a CARD_INFO=(`gpg --card-status --with-colons`)
+  # IFS=$OFS
+
+  echo "$INFO"
+}
+
+get_gpg_card_info
+
+exit 1
+
+echo "# Checking System Setup"
+check_required_programs
+echo "# Checking for Yubikeys"
+get_connected_yubikeys
+
+
+exit 0
