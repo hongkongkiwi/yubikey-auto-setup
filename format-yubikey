@@ -1,0 +1,309 @@
+#!/bin/bash
+
+YKMAN_BIN="ykman"
+
+USE_PIV="NO"
+USE_OPENPGP="YES"
+
+YUBKEY_LIST=("")
+
+NFC_ENABLED=""
+OTP_USB_APP=""
+OTP_NFC_APP=""
+FIDO_U2F_USB_APP=""
+FIDO_U2F_NFC_APP=""
+OPENPGP_USB_APP=""
+OPENPGP_NFC_APP=""
+PIV_USB_APP=""
+PIV_NFC_APP=""
+OATH_USB_APP=""
+OATH_NFC_APP=""
+FIDO2_USB_APP=""
+FIDO2_NFC_APP=""
+FIRMWARE_VERSION=""
+TYPE=""
+SERIAL=""
+FORM_FACTOR=""
+USB_INTERFACES=""
+
+function check_required_programs() {
+  command -v ykman >/dev/null 2>&1 || { echo >&2 "I require ykman but it's not installed.  Aborting."; echo >&2 "https://github.com/Yubico/yubikey-manager"; exit 1; }
+  command -v sed >/dev/null 2>&1 || { echo >&2 "I require sed but it's not installed.  Aborting."; exit 1; }
+  command -v grep >/dev/null 2>&1 || { echo >&2 "I require grep but it's not installed.  Aborting."; exit 1; }
+  command -v dd >/dev/null 2>&1 || { echo >&2 "I require dd but it's not installed.  Aborting."; exit 1; }
+  command -v dd >/dev/null 2>&1 || { echo >&2 "I require dd but it's not installed.  Aborting."; exit 1; }
+}
+
+function trim() {
+    local var="$*"
+    # remove leading whitespace characters
+    var="${var#"${var%%[![:space:]]*}"}"
+    # remove trailing whitespace characters
+    var="${var%"${var##*[![:space:]]}"}"
+    echo -n "$var"
+}
+
+function get_info() {
+  INFO=`$YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL info`
+  #(>&2 echo "$INFO")
+  FORM_FACTOR=`trim $(echo -e "$INFO" | grep "Form factor:" | cut -f2 -d':')`
+  FIRMWARE_VERSION=`trim $(echo -e "$INFO" | grep "Firmware version:" | cut -f2 -d':')`
+  TYPE=`trim $(echo -e "$INFO" | grep "Device type:" | cut -f2 -d':')`
+  SERIAL=`trim $(echo -e "$INFO" | grep "Serial number:" | cut -f2 -d':')`
+  USB_INTERFACES=`trim $(echo -e "$INFO" | grep "Enabled USB interfaces:" | cut -f2 -d':')`
+  APPLICATIONS=`echo -e "$INFO" | sed -E $'1,/Applications/ d' | sed -E $'s/ +/ /g' | tr '\t' ':'`
+  #/Applications/,$ s/.*Applications[\t ]*USB?[\t ]*NFC?//'`
+  #OTP_APP=`echo -e "$APPLICATIONS" | sed -e $'s\s*\t?\s*/:/g'`
+  OTP_USB_APP=`echo -e "$APPLICATIONS" | grep "OTP" | cut -f2 -d ":" | tr -d " "`
+  OTP_NFC_APP=`echo -e "$APPLICATIONS" | grep "OTP" | cut -f3 -d ":" | tr -d " "`
+  FIDO_U2F_USB_APP=`echo -e "$APPLICATIONS" | grep "FIDO U2F" | cut -f2 -d ":" | tr -d " "`
+  FIDO_U2F_NFC_APP=`echo -e "$APPLICATIONS" | grep "FIDO U2F" | cut -f3 -d ":" | tr -d " "`
+  OPENPGP_USB_APP=`echo -e "$APPLICATIONS" | grep "OpenPGP" | cut -f2 -d ":" | tr -d " "`
+  OPENPGP_NFC_APP=`echo -e "$APPLICATIONS" | grep "OpenPGP" | cut -f3 -d ":" | tr -d " "`
+  PIV_USB_APP=`echo -e "$APPLICATIONS" | grep "PIV" | cut -f2 -d ":" | tr -d " "`
+  PIV_NFC_APP=`echo -e "$APPLICATIONS" | grep "PIV" | cut -f3 -d ":" | tr -d " "`
+  OATH_USB_APP=`echo -e "$APPLICATIONS" | grep "OATH" | cut -f2 -d ":" | tr -d " "`
+  OATH_NFC_APP=`echo -e "$APPLICATIONS" | grep "OATH" | cut -f3 -d ":" | tr -d " "`
+  FIDO2_USB_APP=`echo -e "$APPLICATIONS" | grep "FIDO2" | cut -f2 -d ":" | tr -d " "`
+  FIDO2_NFC_APP=`echo -e "$APPLICATIONS" | grep "FIDO2" | cut -f3 -d ":" | tr -d " "`
+  if `echo -e "$INFO" | grep -lq "NFC interface is enabled."`; then
+    NFC_ENABLED="Enabled"
+  else
+    NFC_ENABLED="Disabled"
+  fi
+}
+
+function get_connected_yubikeys() {
+  OFS=$IFS
+  IFS=$'\n'
+  declare -a YUBKEY_LIST=(`$YKMAN_BIN list`)
+  IFS=$OFS
+  if [ ${#YUBKEY_LIST[@]} -eq 0 ]; then
+    echo "No Yubikeys Found!"
+    exit 1
+  elif [ ${#YUBKEY_LIST[@]} -gt 1 ]; then
+    echo "Multiple Yubikeys Found!"
+    echo "Please Select One:"
+    for i in "${!YUBKEY_LIST[@]}"; do
+      echo " $i) ${YUBKEY_LIST[i]}"
+    done
+    echo " q) Quit"
+    while true; do
+        read -p '# ' n
+        if [ "$n" == "q" ]; then
+          echo "Exited!"
+          exit 1
+        fi
+        # Check if number
+        re='^[0-9]+$'
+        if ! [[ $n =~ $re ]]; then
+          continue
+        fi
+        # If $n is an integer between one and $count...
+        if [ "$n" -eq "$n" ] && [ "$n" -gt -1 ] && [ "$n" -le "${#YUBKEY_LIST[@]}" ]; then
+          break
+        fi
+    done
+    CURRENT_YUBIKEY_SERIAL=${YUBKEY_LIST[$n]#*"Serial: "}
+    echo "You Selected Device: ${YUBKEY_LIST[$n]}"
+  else
+    CURRENT_YUBIKEY_SERIAL=${YUBKEY_LIST[0]#*"Serial: "}
+    echo " - Found Device Device: ${YUBKEY_LIST[$n]}"
+  fi
+}
+
+function set_interfaces() {
+  # Update the info because it's changed
+  get_info
+  # Disable all NFC on this yubikey
+  if [[ "$NFC_ENABLED" == "Enabled" ]] ||
+      [[ "$FIDO_U2F_NFC_APP" == "Enabled" ]] ||
+      [[ "$OPENPGP_NFC_APP" == "Enabled" ]] ||
+      [[ "$PIV_NFC_APP" == "Enabled" ]] ||
+      [[ "$OTP_NFC_APP" == "Enabled" ]] ||
+      [[ "$OATH_NFC_APP" == "Enabled" ]] ||
+      [[ "$FIDO2_NFC_APP" == "Enabled" ]]; then
+      echo " - NFC is enabled on this Yubikey - For security we will disable it"
+      $YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL config nfc -D -f
+      # Sleep to allow Yubikey to refresh
+      sleep 1
+  fi
+  # Update the info because it's changed
+  get_info
+  if [[ "$OTP_USB_APP" == "Enabled" ]]; then
+    echo " - Disable OTP Function"
+    $YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL config usb -d OTP -f
+    # Sleep to allow Yubikey to refresh
+    sleep 1
+  fi
+  if [[ "$FIDO_U2F_USB_APP" == "Enabled" ]]; then
+    echo " - Disable FIDO2 U2F Function"
+    $YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL config usb -d U2F -f
+    # Sleep to allow Yubikey to refresh
+    sleep 1
+  fi
+  if [[ "$OATH_USB_APP" == "Enabled" ]]; then
+    echo " - Disable USB OATH Function"
+    $YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL config usb -d OATH -f
+    # Sleep to allow Yubikey to refresh
+    sleep 1
+  fi
+  if [[ "$FIDO2_USB_APP" == "Enabled" ]]; then
+    echo " - Disable USB FIDO2 Function"
+    $YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL config usb -d FIDO2 -f
+    sleep 1
+  fi
+  if [[ "$USE_OPENPGP" == "YES" ]]; then
+    if [[ "$OPENPGP_USB_APP" == "Disabled" ]]; then
+      echo " - Enable USB OpenPGP Function"
+      $YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL config usb -e OPGP -f
+      # Sleep to allow Yubikey to refresh
+      sleep 1
+    fi
+  else
+    if [[ "$OPENPGP_USB_APP" == "Enabled" ]]; then
+      echo " - Disable USB OpenPGP Function"
+      $YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL config usb -d OPGP -f
+      # Sleep to allow Yubikey to refresh
+      sleep 1
+    fi
+  fi
+  if [[ "$USE_PIV" == "YES" ]]; then
+    if [[ "$PIV_USB_APP" == "Disabled" ]]; then
+      echo " - Enable USB PIV Function"
+      $YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL config usb -e PIV -f
+      # Sleep to allow Yubikey to refresh
+      sleep 1
+    fi
+  else
+    if [[ "$PIV_USB_APP" == "Enabled" ]]; then
+      echo " - Disable USB PIV Function"
+      $YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL config usb -d PIV -f
+      # Sleep to allow Yubikey to refresh
+      sleep 1
+    fi
+  fi
+  if [[ "$USB_INTERFACES" != "CCID" ]]; then
+    echo " - Set USB mode to CCID"
+    $YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL mode CCID -f
+    # Sleep to allow Yubikey to refresh
+    sleep 1
+  fi
+  # Turn off CCID touch eject
+  $YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL config usb --no-touch-eject -f
+  sleep 1
+  # Update the info because it's changed
+  get_info
+}
+
+function set_openpgp_pin_retries() {
+  ADMIN_PIN="$1"
+  if [[ "$ADMIN_PIN" == "" ]]; then
+    ADMIN_PIN=12345678
+  fi
+  PIN_RETRIES="$2"
+  if [[ "$PIN_RETRIES" == "" ]]; then
+    PIN_RETRIES=3
+  fi
+  RESET_RETRIES="$3"
+  if [[ "$RESET_RETRIES" == "" ]]; then
+    RESET_RETRIES=3
+  fi
+  ADMIN_RETRIES="$4"
+  if [[ "$ADMIN_RETRIES" == "" ]]; then
+    ADMIN_RETRIES=3
+  fi
+  $YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL openpgp set-pin-retries -f --admin-pin $ADMIN_PIN $PIN_RETRIES $RESET_RETRIES $ADMIN_RETRIES  > /dev/null
+}
+
+function piv_set_ccc() {
+  KEY="$1"
+  if [[ "$MGMT_KEY" == "" ]]; then
+    KEY="010203040506070801020304050607080102030405060708"
+  fi
+  $YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL piv set-ccc -m "$KEY"
+  sleep 1
+}
+
+function piv_set_chuid() {
+  KEY="$1"
+  if [[ "$KEY" == "" ]]; then
+    KEY="010203040506070801020304050607080102030405060708"
+  fi
+  $YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL piv set-chuid -m "$KEY"
+  sleep 1
+}
+
+function reset_piv_data() {
+  $YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL piv reset -f > /dev/null
+  sleep 1
+  piv_set_ccc
+  piv_set_chuid
+  # PIN:	123456
+	# PUK:	12345678
+	# Management Key:	010203040506070801020304050607080102030405060708
+}
+
+function reset_openpgp_data() {
+  $YKMAN_BIN -d $CURRENT_YUBIKEY_SERIAL openpgp reset -f > /dev/null
+  # PIN:         123456
+  # Reset code:  NOT SET
+  # Admin PIN:   12345678
+  sleep 1
+  set_openpgp_pin_retries 12345678 3 3 3
+}
+
+function warn_user() {
+  echo "*** WARNING ***"
+  read -r -p " This will completely reset your Yubikey. Are you sure? [y/N] " response
+  case "$response" in
+    [yY][eE][sS]|[yY])
+      ;;
+    *)
+      echo "Exited!"; exit 1
+      ;;
+  esac
+}
+
+echo "# Checking System Setup"
+check_required_programs
+echo "# Checking for Yubikeys"
+get_connected_yubikeys
+#reset_device
+echo "# Analysing Yubikey"
+get_info
+warn_user
+echo "# Updating Interfaces (USB & NFC)"
+set_interfaces
+if [[ "$OPENPGP_USB_APP" == "Enabled" ]]; then
+  echo "# Resetting OpenPGP Data"
+  reset_openpgp_data
+fi
+if [[ "$PIV_USB_APP" == "Enabled" ]]; then
+  echo "# Resetting PIV Data"
+  reset_piv_data
+fi
+echo "# All Done"
+
+exit 0
+#echo "$INFO"
+# echo "NFC Interface: $NFC_ENABLED"
+# #echo -e "APPLICATIONS:\n$APPLICATIONS"
+# #echo "OTP APP: $OTP_APP"
+# echo "OTP (USB): $OTP_USB_APP"
+# echo "OTP (NFC): $OTP_NFC_APP"
+# echo "FIDO U2F (USB): $FIDO_U2F_USB_APP"
+# echo "FIDO U2F (NFC): $FIDO_U2F_NFC_APP"
+# echo "OpenPGP (USB): $OPENPGP_USB_APP"
+# echo "OpenPGP (NFC): $OPENPGP_NFC_APP"
+# echo "PIV (USB): $PIV_USB_APP"
+# echo "PIV (NFC): $PIV_NFC_APP"
+# echo "OATH (USB): $OATH_USB_APP"
+# echo "OATH (NFC): $OATH_NFC_APP"
+# echo "FIDO2 (USB): $FIDO2_USB_APP"
+# echo "FIDO2 (NFC): $FIDO2_NFC_APP"
+# echo "FIRMWARE VERSION: $FIRMWARE_VERSION"
+# echo "TYPE: $TYPE"
+# echo "SERIAL: $SERIAL"
+# echo "FORM FACTOR: $FORM_FACTOR"
+# echo "USB INTERFACES: $USB_INTERFACES"
