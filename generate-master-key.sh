@@ -161,7 +161,7 @@ export GNUPGHOME="$(mktemp -d)"
 [[ "$3" != "" ]] && COMMENT=$3 || { read -p 'Comment: ' COMMENT; }
 
 # Some user defined fields
-OUTDIR="out"
+OUTDIR="keys"
 ADMIN_KEY=`random_numbers 8`
 USER_KEY=`random_numbers 6`
 KEY_PASSWORD=`random_chars 32`
