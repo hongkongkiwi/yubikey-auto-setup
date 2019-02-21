@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Here is a great selection of info about Yubikey and gpg
 # https://xladius.com/opsec/2018/06/25/using-yubikeys-for-openpgp
@@ -10,6 +10,10 @@ YKMAN_BIN="ykman"
 GPG_BIN="gpg"
 
 YUBKEY_LIST=("")
+
+# Fix for GPG error
+# https://github.com/keybase/keybase-issues/issues/2798
+export GPG_TTY=$(tty)
 
 function check_required_programs() {
   command -v ykman >/dev/null 2>&1 || { echo >&2 "I require ykman but it's not installed.  Aborting."; echo >&2 "https://github.com/Yubico/yubikey-manager"; exit 1; }
@@ -88,30 +92,90 @@ function reset_openpgp_data() {
   	echo y
   	echo yes
     echo quit
-  } | $GPG_BIN --command-fd=0 --status-fd=1 --card-edit
+  } | $GPG_BIN \
+    --command-fd=0 --status-fd=1 \
+    --batch --quiet --no-greeting \
+    --card-edit
 }
 
 function change_openpgp_pin() {
+  PINCODE=$1
+  PASSWD_FD_NUM=9
+  PASSWD_FD_FILE="/tmp/foo"
+  eval "exec ${PASSWD_FD_NUM}<>${PASSWD_FD_FILE}"
+  eval "echo "$PINCODE">&${PASSWD_FD_NUM}"
   {
   	echo admin
   	echo passwd
-  	echo 3
+  	echo 1
   	echo Q
   	echo quit
-  } | $GPG_BIN --command-fd=0 --status-fd=1 --card-edit
+  } | $GPG_BIN \
+    --command-fd=0 --status-fd=1 \
+    --pinentry-mode loopback \
+    --passphrase-fd=$PASSWD_FD_NUM \
+    --batch --quiet --no-greeting \
+    --card-edit
+  eval "exec ${PASSWD_FD_NUM}>&-"
+}
+
+function open_fd() {
+  STATUS_FD_NUM=9
+  ERROR_FD_NUM=8
+  STATUS_FD_FILE=`mktemp /tmp/gpg.XXXXXXXXXX` || { echo "Unable to make temp file!"; exit 1; }
+  ERROR_FD_FILE=`mktemp /tmp/gpg.XXXXXXXXXX` || { echo "Unable to make temp file!"; exit 1; }
+  eval "exec ${STATUS_FD_NUM}<>${STATUS_FD_FILE}"
+  eval "exec ${ERROR_FD_NUM}<>${ERROR_FD_FILE}"
+  OUTPUT=""
+  STATUS=""
+}
+
+function close_fd() {
+  # Cleanup File Descriptors
+  [[ "$STATUS_FD_NUM" != "" ]] && eval "exec ${STATUS_FD_NUM}>&-"
+  [[ "$ERROR_FD_NUM" != "" ]] && eval "exec ${ERROR_FD_NUM}>&-"
+  [ -f "$ERROR_FD_FILE" ] && OUTPUT=`cat "$ERROR_FD_FILE"`
+  [ -f "$STATUS_FD_FILE" ] && STATUS=`cat "$STATUS_FD_FILE"`
+  [ -f "$PASSWD_FILE" ] && rm "$PASSWD_FILE"
+  [ -f "$STATUS_FD_FILE" ] && rm "$STATUS_FD_FILE"
+  [ -f "$ERROR_FD_FILE" ] && rm "$ERROR_FD_FILE"
+}
+
+function get_admin_passwd_file() {
+  if [[ "$ADMIN_PINCODE" == "" ]]; then
+    ADMIN_PINCODE="12345678"
+  fi
+  PASSWD_FILE=`mktemp /tmp/gpg.XXXXXXXXXX` || { echo "Unable to make temp file!"; exit 1; }
+  echo -e $ADMIN_PINCODE>"${PASSWD_FILE}"
+  kill_gpg_agent
+}
+
+function remove_admin_passwd_file() {
+  [ -f "$PASSWD_FILE" ] && rm "$PASSWD_FILE"
 }
 
 function reset_openpgp_data() {
+  open_fd
   {
   	echo admin
   	echo factory-reset
   	echo y
   	echo yes
     echo quit
-  } | $GPG_BIN --command-fd=0 --status-fd=1 --card-edit
+  } | $GPG_BIN \
+    --command-fd=0 --logger-fd=$ERROR_FD_NUM --status-fd=$STATUS_FD_NUM \
+    --batch --quiet --no-greeting \
+    --card-edit 2> /dev/null
+  close_fd
 }
 
-function change_key_size() {
+function change_key_sizes() {
+  ADMIN_PINCODE="$1"
+  if [[ "$ADMIN_PINCODE" == "" ]]; then
+    ADMIN_PINCODE="12345678"
+  fi
+  open_fd
+  get_admin_passwd_file "$ADMIN_PINCODE"
   # The algorithms supported by nitrokey pro are rsa 2048 at rsa 4096
   # change in the size of the keys
   {
@@ -124,7 +188,14 @@ function change_key_size() {
   	echo 1           # (1) RSA (2) ECC RSA for the authentication subkey
   	echo 2048        # 2048-4096 the size of the subkey authentication
   	echo quit
-  } | $GPG_BIN --command-fd = 0 --status-fd = 1 --card-edit
+  } | $GPG_BIN \
+    --command-fd=0 --logger-fd=$ERROR_FD_NUM --status-fd=$STATUS_FD_NUM \
+    --passphrase-file "$PASSWD_FILE" \
+    --pinentry-mode loopback \
+    --batch --quiet --no-greeting \
+    --card-edit 2> /dev/null
+  close_fd
+  remove_admin_passwd_file
 }
 
 function generate_keys() {
@@ -141,28 +212,83 @@ function generate_keys() {
   	echo o            # yes confirmation of information for key
   	echo list         # display information in the map
   	echo quit
-  } | $GPG_BIN --command-fd = 0 --status-fd = 1 --card-edit
+  } | $GPG_BIN \
+    --command-fd=0 --status-fd=1 \
+    --pinentry-mode loopback \
+    --passphrase-fd=$PASSWD_FD_NUM \
+    --batch --quiet --no-greeting \
+    --card-edit
+  eval "exec ${PASSWD_FD_NUM}>&-"
+}
+
+# Pass a second value to change chaching time hwen it restarts
+function kill_gpg_agent() {
+  # Stupidly the only solution to stop GPG agent caching passwords is to kill it, not to worry it will restart automatically
+  # https://unix.stackexchange.com/questions/193588/how-can-i-tell-gpg-that-i-do-not-want-password-caching-for-a-specific-program
+  if [[ $1 == "" ]]; then
+    pkill gpg-agent
+  else
+    pkill gpg-agent && gpg-agent --default-cache-ttl $1 --use-standard-socket --daemon
+  fi
 }
 
 function personalise_smart_card() {
+  ADMIN_PINCODE="$1"
+  if [[ "$ADMIN_PINCODE" == "" ]]; then
+    ADMIN_PINCODE="12345678"
+  fi
+  FIRST_NAME="$2"
+  LAST_NAME="$3"
+  LOGIN="$4"
+  URL="$5"
+  SEX="u"
+  LANG="en"
+
+  open_fd
+  get_admin_passwd_file "$ADMIN_PINCODE"
+
   # Personalization of the smart card
   {
   	echo admin    # To execute the administrator rights
-  	echo passwd   # To change the user or administrator PIN
-  	echo 1        # Change administrator PIN
-  	echo q        # Leave the PIN change
+  	# echo passwd   # To change the user or administrator PIN
+  	# echo 1        # Change administrator PIN
+  	# echo q        # Leave the PIN change
   	echo name     # To change the user name
   	echo  " $LAST_NAME "     # User's response
   	echo  " $FIRST_NAME "     # Username
-  	echo login    # To change the login
-  	echo  " $LOGIN "  # the user's login
-  	echo sex      # the sex of the user
-  	echo " $SEX "        # (M) ale (F) emele or space if unknown
-  	echo lang     # to change the language
-  	echo " $LANG " # fr for french, en for english
-  	echo list     # show map information
+    [[ "$LOGIN" != "" ]] && { echo login; echo " $LOGIN "; }
+    echo sex
+    [[ "$SEX" != "" ]] && echo " $SEX " || echo " u "
+    [[ "$LANG" != "" ]] && { echo lang; echo " $LANG "; }
+    [[ "$URL" != "" ]] && { echo url; echo " $URL "; }
+  	# echo list     # show map information
   	echo quit     # when editing the map
-  } | $GPG_BIN --command-fd = 0 --status-fd = 1 --card-edit
+  } | $GPG_BIN \
+    --command-fd=0 --logger-fd=$ERROR_FD_NUM --status-fd=$STATUS_FD_NUM \
+    --passphrase-file "$PASSWD_FILE" \
+    --pinentry-mode loopback \
+    --batch --quiet --no-greeting \
+    --card-edit 2> /dev/null
+  close_fd
+  remove_admin_passwd_file
+
+  if [[ "$OUTPUT" != "" ]]; then
+    # Try to handle some errors nicely
+    if echo "$OUTPUT" | grep -q "gpg: error setting Name: Bad PIN"; then
+      echo "ERROR! Bad Pin for card"
+      exit 1
+    elif echo "$OUTPUT" | grep -q "gpg: selecting openpgp failed: Operation not supported by device"; then
+      echo "ERROR! Missing Card?"
+      exit 1
+    elif echo "$OUTPUT" | grep -q "gpg: "; then
+      echo "$OUTPUT" | grep "gpg: "
+      exit 1
+    else
+      echo "ERROR!"
+      echo "$OUTPUT"
+      exit 1
+    fi
+  fi
 }
 
 function get_gpg_card_info() {
@@ -178,18 +304,6 @@ function get_gpg_card_info() {
   CARD_DETAILS_URL=`echo "$CARD_INFO" | grep "url:" | cut -f2 -d':'`
   CARD_DETAILS_LOGIN=`echo "$CARD_INFO" | grep "login:" | cut -f2 -d':'`
   CARD_DETAILS_FORCEPIN=`echo "$CARD_INFO" | grep "forcepin:" | cut -f2 -d':'`
-
-  # echo $CARD_SERIAL
-  # echo $CARD_READER_NAME
-  # echo $CARD_READER_VERSION
-  # echo $CARD_READER_VENDOR_NAME
-  # echo $CARD_DETAILS_FIRST_NAME
-  # echo $CARD_DETAILS_LAST_NAME
-  # echo $CARD_DETAILS_SEX
-  # echo $CARD_DETAILS_LANG
-  # echo $CARD_DETAILS_URL
-  # echo $CARD_DETAILS_LOGIN
-  # echo $CARD_DETAILS_FORCEPIN
 
   # Reader:Yubico Yubikey 4 CCID:AID:23423432:openpgp-card:
   # version:0201:
@@ -216,18 +330,41 @@ function get_gpg_card_info() {
   # IFS=$'\n'
   # declare -a CARD_INFO=(`gpg --card-status --with-colons`)
   # IFS=$OFS
-
-  echo "$INFO"
 }
-
-get_gpg_card_info
-
-exit 1
 
 echo "# Checking System Setup"
 check_required_programs
 echo "# Checking for Yubikeys"
 get_connected_yubikeys
+echo "# Checking for available certificates"
+# SELECT CERTIFICATE TO LOAD
 
+echo "# Resetting OpenPGP Data on Card"
+reset_openpgp_data
+echo "# Personalising OpenPGP Info on Card"
+# READ THIS INFO FROM THE YAML FILE
+personalise_smart_card "" "Test" "Test2" "Logintest" ""
+echo "# Changing Key Sizes"
+change_key_sizes
+echo "# Loading Certificates to Yubikey"
+# LOAD CERTIFICATES HERE
+
+echo "# Cleaning Up"
+# REMOVE TEMPORARY TRUSTDB HERE
+
+echo "# Getting Card Info"
+get_gpg_card_info
+echo
+echo "SERIAL: $CARD_SERIAL"
+echo "READER: $CARD_READER_NAME"
+echo "VERSION: $CARD_READER_VERSION"
+echo "VENDOR: $CARD_READER_VENDOR_NAME"
+echo "FIRST NAME: $CARD_DETAILS_FIRST_NAME"
+echo "LAST NAME: $CARD_DETAILS_LAST_NAME"
+echo "SEX: $CARD_DETAILS_SEX"
+echo "LANG: $CARD_DETAILS_LANG"
+echo "URL: $CARD_DETAILS_URL"
+echo "LOGIN: $CARD_DETAILS_LOGIN"
+echo "FORCE PIN: $CARD_DETAILS_FORCEPIN"
 
 exit 0

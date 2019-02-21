@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+bash format-yubikey
+bash upload-openpgp-key
