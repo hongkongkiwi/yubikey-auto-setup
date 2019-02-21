@@ -163,7 +163,7 @@ export GNUPGHOME="$(mktemp -d)"
 # Some user defined fields
 OUTDIR="keys"
 ADMIN_KEY=`random_numbers 8`
-USER_KEY=`random_numbers 6`
+USER_KEY=123456
 KEY_PASSWORD=`random_chars 32`
 
 KEYNAME_SCHEME=`echo "$NAME" |  tr '[:upper:]' '[:lower:]' | tr ' ' '_'`
@@ -175,13 +175,26 @@ mkdir -p "$OUTDIR"
 echo "# Generating Keys"
 generate_master_key "$NAME" "$COMMENT" "$EMAIL" "$KEY_PASSWORD"
 KEY_IDS=(`get_key_info`)
+
 # Extract Master Key
 echo "# Extracting Master Key"
 extract_secret_key "${KEY_IDS[0]}" "$MASTERKEY_NAME" "$KEY_PASSWORD"
+
 # Extract Sub Key
 echo "# Extracting Sub Key"
 extract_secret_key "${KEY_IDS[1]}" "$SUBKEY_NAME" "$KEY_PASSWORD"
+
+# Generate Symetrically signed test file
+
+echo "# Generating Sub Key Test File"
+
+
 # Generate the Info YAML
 echo "# Generating Info YAML"
 create_info_yaml "$YAML_NAME" "$SUBKEY_NAME" "$NAME" "$EMAIL" "$KEY_PASSWORD" "$USER_KEY" "$ADMIN_KEY"
+
+echo "# Deleting Keys from Keyring"
+delete_key "${KEY_IDS[0]}"
+delete_key "${KEY_IDS[1]}"
+
 echo "# All Done"
